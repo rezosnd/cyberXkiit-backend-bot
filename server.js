@@ -48,6 +48,8 @@ const upload = multer({
 
 // Store messages
 const messages = new Map();
+// Store last processed update ID for polling
+let lastUpdateId = 0;
 
 // Add initial welcome messages for new users
 function initializeUser(userId) {
@@ -84,7 +86,7 @@ function addMessage(userId, from, type, content, media = null, caption = "") {
   };
   arr.push(message);
   messages.set(userId, arr);
-  console.log(`💾 Stored ${type} message for ${userId}`);
+  console.log(`💾 Stored ${type} message for ${userId} from ${from}: ${content.substring(0, 50)}...`);
   return message;
 }
 
@@ -100,20 +102,21 @@ async function sendToTelegram(text, filePath = null, caption = "") {
     const form = new FormData();
     form.append('chat_id', CHAT_ID);
     
-    if (caption) form.append('caption', caption);
-
     let method = 'sendMessage';
     
     if (filePath) {
       if (filePath.match(/\.(jpg|jpeg|png|gif)$/i)) {
         method = 'sendPhoto';
         form.append('photo', fs.createReadStream(filePath));
+        if (caption) form.append('caption', caption);
       } else if (filePath.match(/\.(mp3|wav|m4a|ogg)$/i)) {
         method = 'sendVoice';
         form.append('voice', fs.createReadStream(filePath));
+        if (caption) form.append('caption', caption);
       } else {
         method = 'sendDocument';
         form.append('document', fs.createReadStream(filePath));
+        if (caption) form.append('caption', caption);
       }
     } else {
       form.append('text', text);
@@ -125,7 +128,11 @@ async function sendToTelegram(text, filePath = null, caption = "") {
     });
     
     console.log(`✅ Telegram ${method} successful`);
-    return { success: true, data: response.data };
+    return { 
+      success: true, 
+      data: response.data,
+      message_id: response.data.result?.message_id 
+    };
     
   } catch (error) {
     console.error("❌ Telegram error:", error.response?.data || error.message);
@@ -134,6 +141,130 @@ async function sendToTelegram(text, filePath = null, caption = "") {
       error: error.response?.data || error.message 
     };
   }
+}
+
+// Function to poll Telegram for updates (expert replies)
+async function pollTelegramUpdates() {
+  if (!BOT_TOKEN || BOT_TOKEN === "your_bot_token_here") {
+    return;
+  }
+
+  try {
+    const url = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates`;
+    const params = {
+      offset: lastUpdateId + 1,
+      timeout: 10,
+      allowed_updates: ['message']
+    };
+
+    const response = await axios.get(url, { params });
+    const updates = response.data.result || [];
+
+    for (const update of updates) {
+      lastUpdateId = update.update_id;
+      const msg = update.message;
+
+      if (msg && msg.text && msg.chat && msg.chat.id.toString() === CHAT_ID.toString()) {
+        const text = msg.text.trim();
+        console.log(`📨 Received Telegram message: ${text.substring(0, 100)}...`);
+        
+        // Parse expert reply - looking for user ID in various formats
+        let userId = null;
+        let replyText = text;
+        
+        // Pattern 1: Direct format "user123: message"
+        const directMatch = text.match(/^([a-zA-Z0-9_]+)[:\s]+(.+)/i);
+        if (directMatch) {
+          userId = directMatch[1];
+          replyText = directMatch[2].trim();
+        } 
+        // Pattern 2: Contains "user" prefix
+        else if (text.toLowerCase().includes('user')) {
+          const userMatch = text.match(/user\s*([a-zA-Z0-9_]+)/i);
+          if (userMatch) {
+            userId = userMatch[1];
+            // Try to extract the actual message after user ID
+            const messageMatch = text.match(new RegExp(`user\\s*${userId}\\s*[:\\s]+(.+)`, 'i'));
+            if (messageMatch) {
+              replyText = messageMatch[1].trim();
+            }
+          }
+        }
+        // Pattern 3: Check if it might be a reply to a previous message (checking for any alphanumeric ID at start)
+        else {
+          const idMatch = text.match(/^([a-zA-Z0-9_]+)$/);
+          if (idMatch && idMatch[1].length >= 3) {
+            // This might be just a user ID without message
+            userId = idMatch[1];
+            replyText = "(Expert connected)";
+          } else {
+            // Check if message starts with what looks like a user ID
+            const potentialIdMatch = text.match(/^([a-zA-Z0-9_]{3,})[^a-zA-Z0-9_]/);
+            if (potentialIdMatch) {
+              userId = potentialIdMatch[1];
+              replyText = text.substring(potentialIdMatch[0].length).trim();
+            }
+          }
+        }
+
+        if (userId && replyText) {
+          // Check if this is a duplicate message
+          const userMessages = messages.get(userId) || [];
+          const isDuplicate = userMessages.some(m => 
+            m.text === replyText && m.from === "expert"
+          );
+          
+          if (!isDuplicate) {
+            addMessage(userId, "expert", "text", replyText);
+            console.log(`✅ Expert reply stored for user ${userId}: "${replyText.substring(0, 50)}..."`);
+          } else {
+            console.log(`⚠️ Duplicate expert message for ${userId}, ignoring`);
+          }
+        } else {
+          console.log(`⚠️ Could not parse expert message: ${text}`);
+          
+          // Try one more method: Check if message contains any known user ID
+          if (!userId) {
+            for (const [existingUserId] of messages) {
+              if (text.toLowerCase().includes(existingUserId.toLowerCase())) {
+                userId = existingUserId;
+                replyText = text.replace(new RegExp(existingUserId, 'gi'), '').trim();
+                if (replyText) {
+                  addMessage(userId, "expert", "text", replyText);
+                  console.log(`✅ Found user ${userId} in message`);
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    
+    // If we got updates, log how many
+    if (updates.length > 0) {
+      console.log(`📊 Processed ${updates.length} Telegram updates`);
+    }
+    
+  } catch (error) {
+    console.error("❌ Error polling Telegram updates:", error.message);
+  }
+}
+
+// Start polling for Telegram updates
+function startPolling() {
+  console.log("🔄 Starting Telegram polling...");
+  
+  // Initial poll
+  pollTelegramUpdates();
+  
+  // Poll every 3 seconds
+  setInterval(pollTelegramUpdates, 3000);
+}
+
+// Start polling when server starts
+if (BOT_TOKEN && BOT_TOKEN !== "your_bot_token_here") {
+  setTimeout(startPolling, 2000); // Wait 2 seconds before starting
 }
 
 // Text endpoint
@@ -150,8 +281,8 @@ app.post("/send", async (req, res) => {
     // Store message
     const message = addMessage(userId, "user", "text", text);
     
-    // Send to Telegram
-    const telegramText = `📩 USER ${userId}\n\n${text}`;
+    // Send to Telegram with user ID in message
+    const telegramText = `👤 User: ${userId}\n\n💬 Message: ${text}\n\n⏰ Time: ${new Date().toLocaleString()}\n\n📝 Reply format: ${userId}: your_message`;
     const telegramResult = await sendToTelegram(telegramText);
     
     if (telegramResult.success) {
@@ -160,7 +291,8 @@ app.post("/send", async (req, res) => {
         ok: true, 
         message: "Message sent to Telegram",
         messageId: message.ts,
-        telegram: true
+        telegram: true,
+        instruction: `Expert should reply with: ${userId}: [message]`
       });
     } else {
       console.log("⚠️ Telegram failed, but message stored");
@@ -195,8 +327,8 @@ app.post("/send-photo", upload.single('photo'), async (req, res) => {
     // Store message
     const message = addMessage(userId, "user", "photo", "Photo", file.filename, caption || "");
     
-    // Send to Telegram
-    const telegramCaption = caption ? `${caption}\n\n👤 User ID: ${userId}` : `👤 User ID: ${userId}`;
+    // Send to Telegram with user ID in caption
+    const telegramCaption = `👤 User: ${userId}\n\n${caption || "Photo"}\n\n⏰ Time: ${new Date().toLocaleString()}\n\n📝 Reply format: ${userId}: your_message`;
     const telegramResult = await sendToTelegram("", file.path, telegramCaption);
     
     // Clean up file
@@ -211,7 +343,8 @@ app.post("/send-photo", upload.single('photo'), async (req, res) => {
         fileName: file.originalname,
         fileSize: file.size,
         mediaUrl: `/uploads/${file.filename}`,
-        telegram: true
+        telegram: true,
+        instruction: `Expert should reply with: ${userId}: [message]`
       });
     } else {
       console.log("⚠️ Telegram failed, but photo stored");
@@ -250,8 +383,8 @@ app.post("/send-document", upload.single('document'), async (req, res) => {
     // Store message
     const message = addMessage(userId, "user", "document", file.originalname, file.filename, caption || "");
     
-    // Send to Telegram
-    const telegramCaption = caption ? `${caption}\n\n👤 User ID: ${userId}` : `👤 User ID: ${userId}`;
+    // Send to Telegram with user ID in caption
+    const telegramCaption = `👤 User: ${userId}\n\n${caption || "Document"}\n\n📁 File: ${file.originalname}\n⏰ Time: ${new Date().toLocaleString()}\n\n📝 Reply format: ${userId}: your_message`;
     const telegramResult = await sendToTelegram("", file.path, telegramCaption);
     
     // Clean up file
@@ -266,7 +399,8 @@ app.post("/send-document", upload.single('document'), async (req, res) => {
         fileName: file.originalname,
         fileSize: file.size,
         mediaUrl: `/uploads/${file.filename}`,
-        telegram: true
+        telegram: true,
+        instruction: `Expert should reply with: ${userId}: [message]`
       });
     } else {
       console.log("⚠️ Telegram failed, but document stored");
@@ -289,68 +423,142 @@ app.post("/send-document", upload.single('document'), async (req, res) => {
   }
 });
 
-// Telegram Webhook for expert replies
-app.post("/telegram-webhook", (req, res) => {
-  console.log("🔔 Telegram webhook received");
+// Manual check for expert replies (optional endpoint)
+app.get("/check-replies/:userId", async (req, res) => {
+  const userId = req.params.userId;
+  console.log(`🔍 Manual check for replies for ${userId}`);
+  
+  if (!BOT_TOKEN || BOT_TOKEN === "your_bot_token_here") {
+    return res.json({ ok: false, error: "Telegram bot not configured" });
+  }
   
   try {
-    const msg = req.body?.message || req.body?.edited_message;
+    // Force a poll to check for new messages
+    await pollTelegramUpdates();
     
-    if (!msg || !msg.text) {
-      return res.sendStatus(200);
-    }
+    // Get user messages to see if any new expert messages were added
+    const userMessages = messages.get(userId) || [];
+    const expertMessages = userMessages.filter(m => m.from === "expert");
+    const latestExpertMessage = expertMessages[expertMessages.length - 1];
     
-    const text = msg.text.trim();
-    console.log("📨 Telegram message:", text.substring(0, 100));
-    
-    // Parse USER ID from message
-    let userId = null;
-    
-    // Format 1: "USER user_id: message"
-    let match = text.match(/USER\s+([a-zA-Z0-9_]+)\s*:\s*([\s\S]+)/i);
-    if (!match) {
-      // Format 2: "USER user_id\nmessage"
-      match = text.match(/USER\s+([a-zA-Z0-9_]+)[\s\n]+([\s\S]+)/i);
-    }
-    
-    if (match) {
-      userId = match[1];
-      const replyText = match[2].trim();
-      
-      if (userId && replyText) {
-        addMessage(userId, "expert", "text", replyText);
-        console.log(`✅ Expert reply stored for ${userId}`);
-      }
-    }
-    
-    return res.sendStatus(200);
+    return res.json({ 
+      ok: true, 
+      hasNewReplies: expertMessages.length > 2, // More than 2 welcome messages
+      expertMessageCount: expertMessages.length - 2, // Exclude welcome messages
+      latestExpertMessage: latestExpertMessage,
+      timestamp: Date.now()
+    });
     
   } catch (error) {
-    console.error("❌ Webhook error:", error);
-    return res.sendStatus(200);
+    console.error("❌ Check replies error:", error);
+    return res.status(500).json({ error: "Failed to check replies" });
   }
 });
 
-// Get messages - FIXED: Always returns messages
+// Get messages - Always returns messages
 app.get("/messages/:userId", (req, res) => {
   const userId = req.params.userId;
   console.log(`📥 Fetching messages for ${userId}`);
   
-  // Initialize user if doesn't exist
-  initializeUser(userId);
-  
-  const data = messages.get(userId) || [];
-  console.log(`📊 Returning ${data.length} messages`);
-  
-  // Convert file paths to URLs
-  const formattedData = data.map(msg => {
-    if (msg.media && msg.type !== 'text') {
-      return { ...msg, media: `/uploads/${msg.media}` };
-    }
-    return msg;
+  // Force a poll to check for new expert messages
+  pollTelegramUpdates().then(() => {
+    // Initialize user if doesn't exist
+    initializeUser(userId);
+    
+    const data = messages.get(userId) || [];
+    console.log(`📊 Returning ${data.length} messages for ${userId}`);
+    
+    // Convert file paths to URLs
+    const formattedData = data.map(msg => {
+      if (msg.media && msg.type !== 'text') {
+        return { 
+          ...msg, 
+          mediaUrl: `/uploads/${msg.media}`,
+          media: `/uploads/${msg.media}` 
+        };
+      }
+      return msg;
+    });
+    
+    return res.json(formattedData);
+  }).catch(err => {
+    console.error("Error polling during messages fetch:", err);
+    // Still return messages even if polling fails
+    initializeUser(userId);
+    const data = messages.get(userId) || [];
+    const formattedData = data.map(msg => {
+      if (msg.media && msg.type !== 'text') {
+        return { 
+          ...msg, 
+          mediaUrl: `/uploads/${msg.media}`,
+          media: `/uploads/${msg.media}` 
+        };
+      }
+      return msg;
+    });
+    return res.json(formattedData);
+  });
+});
+
+// Get all users (admin endpoint)
+app.get("/users", (req, res) => {
+  const userList = Array.from(messages.keys()).map(userId => {
+    const userMessages = messages.get(userId) || [];
+    const lastMessage = userMessages[userMessages.length - 1];
+    const expertMessages = userMessages.filter(m => m.from === "expert").length - 2; // Exclude welcome
+    const userMessagesCount = userMessages.filter(m => m.from === "user").length;
+    
+    return {
+      userId,
+      totalMessages: userMessages.length,
+      userMessages: userMessagesCount,
+      expertMessages: expertMessages > 0 ? expertMessages : 0,
+      lastActivity: lastMessage?.ts || null,
+      lastMessage: lastMessage?.text?.substring(0, 50) || "No messages"
+    };
   });
   
-  return res.json(formattedData);
+  res.json({
+    totalUsers: messages.size,
+    users: userList
+  });
+});
+
+// Send expert message manually (for testing)
+app.post("/send-expert-reply", async (req, res) => {
+  const { userId, text } = req.body || {};
+  
+  if (!userId || !text) {
+    return res.status(400).json({ error: "Missing userId or text" });
+  }
+  
+  try {
+    addMessage(userId, "expert", "text", text);
+    console.log(`✅ Manual expert reply added for ${userId}: ${text}`);
+    
+    return res.json({
+      ok: true,
+      message: "Expert reply added",
+      userId,
+      text
+    });
+  } catch (err) {
+    console.error("Error adding expert reply:", err);
+    return res.status(500).json({ error: "Failed to add expert reply" });
+  }
+});
+
+// Clear messages for a user (for testing)
+app.delete("/clear-messages/:userId", (req, res) => {
+  const userId = req.params.userId;
+  
+  if (messages.has(userId)) {
+    messages.delete(userId);
+    console.log(`🧹 Cleared messages for ${userId}`);
+    return res.json({ ok: true, message: `Messages cleared for ${userId}` });
+  } else {
+    return res.json({ ok: false, message: `No messages found for ${userId}` });
+  }
 });
 
 // Static files
@@ -363,22 +571,46 @@ app.get("/health", (req, res) => {
     ts: Date.now(),
     telegramConfigured: !!(BOT_TOKEN && CHAT_ID && BOT_TOKEN !== "your_bot_token_here"),
     totalUsers: messages.size,
-    totalMessages: Array.from(messages.values()).reduce((sum, msgs) => sum + msgs.length, 0)
+    totalMessages: Array.from(messages.values()).reduce((sum, msgs) => sum + msgs.length, 0),
+    polling: "active",
+    lastUpdateId
   });
 });
 
-// Set webhook endpoint
-app.get("/set-webhook", async (req, res) => {
+// Get Telegram bot info
+app.get("/bot-info", async (req, res) => {
   if (!BOT_TOKEN || BOT_TOKEN === "your_bot_token_here") {
     return res.json({ error: "BOT_TOKEN not set" });
   }
   
   try {
-    const webhookUrl = `https://cyberxkiit-backend-bot.onrender.com/telegram-webhook`;
-    const setWebhookUrl = `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook?url=${encodeURIComponent(webhookUrl)}`;
-    
-    const response = await axios.get(setWebhookUrl);
+    const url = `https://api.telegram.org/bot${BOT_TOKEN}/getMe`;
+    const response = await axios.get(url);
     res.json(response.data);
+  } catch (error) {
+    res.json({ error: error.message });
+  }
+});
+
+// Get Telegram updates info
+app.get("/updates-info", async (req, res) => {
+  if (!BOT_TOKEN || BOT_TOKEN === "your_bot_token_here") {
+    return res.json({ error: "BOT_TOKEN not set" });
+  }
+  
+  try {
+    const url = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates`;
+    const response = await axios.get(url);
+    res.json({
+      ok: true,
+      updateCount: response.data.result?.length || 0,
+      lastUpdateId,
+      updates: response.data.result?.map(u => ({
+        update_id: u.update_id,
+        message_text: u.message?.text?.substring(0, 100) || "No text",
+        chat_id: u.message?.chat?.id
+      })) || []
+    });
   } catch (error) {
     res.json({ error: error.message });
   }
@@ -388,14 +620,24 @@ app.get("/set-webhook", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     service: "CyberX × KIIT Expert Chat Backend",
-    status: "✅ Online",
+    status: "✅ Online (Polling Mode)",
     endpoints: {
       "POST /send": "Send text message",
       "POST /send-photo": "Upload photo",
       "POST /send-document": "Upload document",
       "GET /messages/:userId": "Get user messages",
+      "GET /check-replies/:userId": "Check for expert replies",
+      "GET /users": "List all users",
+      "POST /send-expert-reply": "Manually add expert reply (testing)",
       "GET /health": "Health check",
-      "GET /set-webhook": "Set Telegram webhook"
+      "GET /bot-info": "Get bot info",
+      "GET /updates-info": "Get Telegram updates info"
+    },
+    instructions: {
+      telegramSetup: "1. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env",
+      expertInstructions: "2. Expert should send messages in Telegram in format: 'userId: message'",
+      example: "3. Example: 'john123: Hello, I can help with your issue'",
+      polling: "4. System automatically polls Telegram every 3 seconds for expert replies"
     }
   });
 });
@@ -403,5 +645,7 @@ app.get("/", (req, res) => {
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Backend running on port ${PORT}`);
-  console.log(`🌐 URL: https://cyberxkiit-backend-bot.onrender.com`);
+  console.log(`🌐 URL: http://localhost:${PORT}`);
+  console.log(`🔄 Telegram polling: ${BOT_TOKEN && BOT_TOKEN !== "your_bot_token_here" ? "✅ Enabled" : "❌ Disabled (no token)"}`);
+  console.log(`📝 Expert reply format: userId: message`);
 });
