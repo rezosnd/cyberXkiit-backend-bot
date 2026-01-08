@@ -24,8 +24,7 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "your_bot_token_here";
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || "your_chat_id_here";
 
 console.log("✅ Backend started");
-console.log("🤖 Telegram Bot Token:", BOT_TOKEN ? "✅ Set" : "❌ Missing");
-console.log("💬 Telegram Chat ID:", CHAT_ID ? "✅ Set" : "❌ Missing");
+console.log("🤖 Telegram:", BOT_TOKEN ? "✅ Configured" : "❌ Not configured");
 
 // Configure multer
 const storage = multer.diskStorage({
@@ -50,7 +49,30 @@ const upload = multer({
 // Store messages
 const messages = new Map();
 
+// Add initial welcome messages for new users
+function initializeUser(userId) {
+  if (!messages.has(userId)) {
+    const welcomeMessages = [
+      { 
+        from: "expert", 
+        type: "text", 
+        text: "🇮🇳 We are here to make India Fraud Free.", 
+        ts: Date.now() - 2000
+      },
+      { 
+        from: "expert", 
+        type: "text", 
+        text: "Our expert will connect you in less than 1 min.", 
+        ts: Date.now() - 1000
+      }
+    ];
+    messages.set(userId, welcomeMessages);
+    console.log(`👋 Welcome messages added for ${userId}`);
+  }
+}
+
 function addMessage(userId, from, type, content, media = null, caption = "") {
+  initializeUser(userId);
   const arr = messages.get(userId) || [];
   const message = { 
     from, 
@@ -68,8 +90,8 @@ function addMessage(userId, from, type, content, media = null, caption = "") {
 
 // Send to Telegram function
 async function sendToTelegram(text, filePath = null, caption = "") {
-  if (!BOT_TOKEN || !CHAT_ID) {
-    console.log("⚠️ Skipping Telegram: Missing credentials");
+  if (!BOT_TOKEN || !CHAT_ID || BOT_TOKEN === "your_bot_token_here") {
+    console.log("⚠️ Telegram credentials not configured");
     return { success: false, error: "Telegram credentials not set" };
   }
 
@@ -78,14 +100,11 @@ async function sendToTelegram(text, filePath = null, caption = "") {
     const form = new FormData();
     form.append('chat_id', CHAT_ID);
     
-    if (caption) {
-      form.append('caption', caption);
-    }
+    if (caption) form.append('caption', caption);
 
     let method = 'sendMessage';
     
     if (filePath) {
-      // Determine file type
       if (filePath.match(/\.(jpg|jpeg|png|gif)$/i)) {
         method = 'sendPhoto';
         form.append('photo', fs.createReadStream(filePath));
@@ -97,7 +116,6 @@ async function sendToTelegram(text, filePath = null, caption = "") {
         form.append('document', fs.createReadStream(filePath));
       }
     } else {
-      // Text message
       form.append('text', text);
     }
 
@@ -118,7 +136,7 @@ async function sendToTelegram(text, filePath = null, caption = "") {
   }
 }
 
-// Text endpoint WITH Telegram
+// Text endpoint
 app.post("/send", async (req, res) => {
   console.log("📨 /send called:", req.body?.userId);
   
@@ -148,7 +166,7 @@ app.post("/send", async (req, res) => {
       console.log("⚠️ Telegram failed, but message stored");
       return res.json({ 
         ok: true, 
-        message: "Message stored locally (Telegram failed)",
+        message: "Message stored locally (Telegram not configured)",
         messageId: message.ts,
         telegram: false,
         telegramError: telegramResult.error
@@ -161,7 +179,7 @@ app.post("/send", async (req, res) => {
   }
 });
 
-// Photo endpoint WITH Telegram
+// Photo endpoint
 app.post("/send-photo", upload.single('photo'), async (req, res) => {
   console.log("📸 /send-photo called:", req.body?.userId);
   
@@ -199,7 +217,7 @@ app.post("/send-photo", upload.single('photo'), async (req, res) => {
       console.log("⚠️ Telegram failed, but photo stored");
       return res.json({ 
         ok: true, 
-        message: "Photo stored locally (Telegram failed)",
+        message: "Photo stored locally (Telegram not configured)",
         messageId: message.ts,
         fileName: file.originalname,
         fileSize: file.size,
@@ -216,7 +234,7 @@ app.post("/send-photo", upload.single('photo'), async (req, res) => {
   }
 });
 
-// Document endpoint WITH Telegram
+// Document endpoint
 app.post("/send-document", upload.single('document'), async (req, res) => {
   console.log("📎 /send-document called:", req.body?.userId);
   
@@ -254,7 +272,7 @@ app.post("/send-document", upload.single('document'), async (req, res) => {
       console.log("⚠️ Telegram failed, but document stored");
       return res.json({ 
         ok: true, 
-        message: "Document stored locally (Telegram failed)",
+        message: "Document stored locally (Telegram not configured)",
         messageId: message.ts,
         fileName: file.originalname,
         fileSize: file.size,
@@ -313,11 +331,18 @@ app.post("/telegram-webhook", (req, res) => {
   }
 });
 
-// Get messages
+// Get messages - FIXED: Always returns messages
 app.get("/messages/:userId", (req, res) => {
   const userId = req.params.userId;
-  const data = messages.get(userId) || [];
+  console.log(`📥 Fetching messages for ${userId}`);
   
+  // Initialize user if doesn't exist
+  initializeUser(userId);
+  
+  const data = messages.get(userId) || [];
+  console.log(`📊 Returning ${data.length} messages`);
+  
+  // Convert file paths to URLs
   const formattedData = data.map(msg => {
     if (msg.media && msg.type !== 'text') {
       return { ...msg, media: `/uploads/${msg.media}` };
@@ -328,12 +353,15 @@ app.get("/messages/:userId", (req, res) => {
   return res.json(formattedData);
 });
 
+// Static files
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
 // Health check
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
     ts: Date.now(),
-    telegramConfigured: !!(BOT_TOKEN && CHAT_ID),
+    telegramConfigured: !!(BOT_TOKEN && CHAT_ID && BOT_TOKEN !== "your_bot_token_here"),
     totalUsers: messages.size,
     totalMessages: Array.from(messages.values()).reduce((sum, msgs) => sum + msgs.length, 0)
   });
@@ -341,7 +369,7 @@ app.get("/health", (req, res) => {
 
 // Set webhook endpoint
 app.get("/set-webhook", async (req, res) => {
-  if (!BOT_TOKEN) {
+  if (!BOT_TOKEN || BOT_TOKEN === "your_bot_token_here") {
     return res.json({ error: "BOT_TOKEN not set" });
   }
   
@@ -356,12 +384,24 @@ app.get("/set-webhook", async (req, res) => {
   }
 });
 
-// Static files
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// Root endpoint
+app.get("/", (req, res) => {
+  res.json({
+    service: "CyberX × KIIT Expert Chat Backend",
+    status: "✅ Online",
+    endpoints: {
+      "POST /send": "Send text message",
+      "POST /send-photo": "Upload photo",
+      "POST /send-document": "Upload document",
+      "GET /messages/:userId": "Get user messages",
+      "GET /health": "Health check",
+      "GET /set-webhook": "Set Telegram webhook"
+    }
+  });
+});
 
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Backend running on port ${PORT}`);
-  console.log(`🌐 Webhook URL: https://cyberxkiit-backend-bot.onrender.com/telegram-webhook`);
-  console.log(`🔗 Set webhook: https://cyberxkiit-backend-bot.onrender.com/set-webhook`);
+  console.log(`🌐 URL: https://cyberxkiit-backend-bot.onrender.com`);
 });
