@@ -65,7 +65,7 @@ function addMessage(userId, from, type, content, media = null, caption = "") {
 }
 
 // Function to send different types of media to Telegram
-async function sendToTelegram(type, mediaData, caption = "", userId = "") {
+async function sendToTelegram(type, filePath, caption = "", userId = "") {
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/`;
   const form = new FormData();
   
@@ -88,64 +88,22 @@ async function sendToTelegram(type, mediaData, caption = "", userId = "") {
   switch (type) {
     case 'text':
       method = 'sendMessage';
-      form.append('text', mediaData);
+      form.append('text', filePath); // filePath is actually text in this case
       break;
       
     case 'photo':
       method = 'sendPhoto';
-      if (mediaData.startsWith('http')) {
-        form.append('photo', mediaData);
-      } else if (mediaData.startsWith('data:')) {
-        // Handle base64 image
-        const matches = mediaData.match(/^data:image\/(\w+);base64,(.+)$/);
-        if (matches) {
-          const buffer = Buffer.from(matches[2], 'base64');
-          form.append('photo', buffer, {
-            filename: `photo_${Date.now()}.${matches[1]}`,
-            contentType: `image/${matches[1]}`
-          });
-        }
-      } else {
-        // Assume it's a file path
-        form.append('photo', fs.createReadStream(mediaData));
-      }
+      form.append('photo', fs.createReadStream(filePath));
       break;
       
     case 'document':
       method = 'sendDocument';
-      if (mediaData.startsWith('http')) {
-        form.append('document', mediaData);
-      } else if (mediaData.startsWith('data:')) {
-        const matches = mediaData.match(/^data:(.+);base64,(.+)$/);
-        if (matches) {
-          const buffer = Buffer.from(matches[2], 'base64');
-          form.append('document', buffer, {
-            filename: `document_${Date.now()}.${matches[1].split('/')[1]}`,
-            contentType: matches[1]
-          });
-        }
-      } else {
-        form.append('document', fs.createReadStream(mediaData));
-      }
+      form.append('document', fs.createReadStream(filePath));
       break;
       
     case 'voice':
-    case 'audio':
       method = 'sendVoice';
-      if (mediaData.startsWith('http')) {
-        form.append('voice', mediaData);
-      } else if (mediaData.startsWith('data:')) {
-        const matches = mediaData.match(/^data:audio\/(\w+);base64,(.+)$/);
-        if (matches) {
-          const buffer = Buffer.from(matches[2], 'base64');
-          form.append('voice', buffer, {
-            filename: `voice_${Date.now()}.${matches[1]}`,
-            contentType: `audio/${matches[1]}`
-          });
-        }
-      } else {
-        form.append('voice', fs.createReadStream(mediaData));
-      }
+      form.append('voice', fs.createReadStream(filePath));
       break;
       
     default:
@@ -206,7 +164,6 @@ app.post("/send", async (req, res) => {
   const formatted = `📩 TEXT MESSAGE FROM USER ${userId}\n\n${text}`;
   console.log("➡️ Forwarding text to Telegram");
 
-  // Send to Telegram but don't fail the request if Telegram fails
   try {
     const telegramResult = await sendToTelegram('text', formatted, "", userId);
     
@@ -230,7 +187,6 @@ app.post("/send", async (req, res) => {
     }
   } catch (err) {
     console.error("❌ Unexpected error:", err);
-    // Still return success because message was stored
     return res.json({ 
       ok: true, 
       message: "Message stored locally",
@@ -241,7 +197,7 @@ app.post("/send", async (req, res) => {
 });
 
 /* =========================
-   APP → TELEGRAM (PHOTO)
+   APP → TELEGRAM (PHOTO) - Multipart
 ========================= */
 app.post("/send-photo", upload.single('photo'), async (req, res) => {
   console.log("📸 /send-photo called:", req.body?.userId);
@@ -251,7 +207,6 @@ app.post("/send-photo", upload.single('photo'), async (req, res) => {
 
   if (!userId || !file) {
     if (file) {
-      // Clean up uploaded file
       fs.unlinkSync(file.path);
     }
     return res.status(400).json({ error: "Invalid payload" });
@@ -288,7 +243,6 @@ app.post("/send-photo", upload.single('photo'), async (req, res) => {
     }
   } catch (err) {
     console.error("❌ Photo upload error:", err);
-    // Clean up file if exists
     if (req.file?.path && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
     }
@@ -297,7 +251,7 @@ app.post("/send-photo", upload.single('photo'), async (req, res) => {
 });
 
 /* =========================
-   APP → TELEGRAM (DOCUMENT/FILE)
+   APP → TELEGRAM (DOCUMENT/FILE) - Multipart
 ========================= */
 app.post("/send-document", upload.single('document'), async (req, res) => {
   console.log("📎 /send-document called:", req.body?.userId);
@@ -353,7 +307,7 @@ app.post("/send-document", upload.single('document'), async (req, res) => {
 });
 
 /* =========================
-   APP → TELEGRAM (VOICE RECORDING)
+   APP → TELEGRAM (VOICE RECORDING) - Multipart
 ========================= */
 app.post("/send-voice", upload.single('voice'), async (req, res) => {
   console.log("🎤 /send-voice called:", req.body?.userId);
@@ -366,12 +320,6 @@ app.post("/send-voice", upload.single('voice'), async (req, res) => {
       fs.unlinkSync(file.path);
     }
     return res.status(400).json({ error: "Invalid payload" });
-  }
-
-  // Check if file is audio
-  if (!file.mimetype.startsWith('audio/')) {
-    fs.unlinkSync(file.path);
-    return res.status(400).json({ error: "File must be an audio file" });
   }
 
   try {
@@ -409,70 +357,6 @@ app.post("/send-voice", upload.single('voice'), async (req, res) => {
       fs.unlinkSync(req.file.path);
     }
     return res.status(500).json({ error: "Failed to process voice recording" });
-  }
-});
-
-/* =========================
-   APP → TELEGRAM (BASE64 MEDIA)
-========================= */
-app.post("/send-media", async (req, res) => {
-  console.log("🎨 /send-media (base64) called:", req.body?.userId);
-  
-  const { userId, type, data, caption, fileName } = req.body || {};
-
-  if (!userId || !type || !data) {
-    return res.status(400).json({ error: "Invalid payload" });
-  }
-
-  const validTypes = ['photo', 'document', 'voice'];
-  if (!validTypes.includes(type)) {
-    return res.status(400).json({ error: "Invalid media type" });
-  }
-
-  try {
-    // Create temp file for base64 data
-    const tempPath = path.join('uploads', `temp_${Date.now()}_${fileName || 'file'}`);
-    
-    // Decode base64 data
-    const matches = data.match(/^data:(.+);base64,(.+)$/);
-    if (!matches) {
-      return res.status(400).json({ error: "Invalid base64 data" });
-    }
-    
-    const buffer = Buffer.from(matches[2], 'base64');
-    fs.writeFileSync(tempPath, buffer);
-    
-    // Store media message
-    const message = addMessage(userId, "user", type, fileName || `${type} file`, tempPath, caption || "");
-
-    console.log(`➡️ Forwarding ${type} (base64) to Telegram`);
-    const telegramResult = await sendToTelegram(type, tempPath, caption || "", userId);
-    
-    // Clean up temp file
-    fs.unlinkSync(tempPath);
-    
-    if (telegramResult.success) {
-      console.log(`✅ ${type} sent to Telegram`);
-      return res.json({ 
-        ok: true, 
-        message: `${type} sent to Telegram`,
-        messageId: message.ts,
-        fileId: telegramResult.fileId,
-        telegram: telegramResult.data
-      });
-    } else {
-      console.log(`⚠️ ${type} send partially failed, but stored locally`);
-      return res.json({ 
-        ok: true, 
-        message: `${type} stored locally, but Telegram failed`,
-        warning: "Telegram forward failed",
-        telegramError: telegramResult.error,
-        messageId: message.ts
-      });
-    }
-  } catch (err) {
-    console.error("❌ Media upload error:", err);
-    return res.status(500).json({ error: "Failed to process media" });
   }
 });
 
@@ -525,7 +409,6 @@ app.post("/telegram-webhook", (req, res) => {
 
     // Handle different message types
     if (msg.text && !isReply) {
-      // Text message (not a reply, contains USER pattern)
       const match = msg.text.match(/USER\s+([a-zA-Z0-9_]+)\s*:\s*([\s\S]+)/i);
       if (match) {
         const replyText = match[2].trim();
@@ -533,41 +416,31 @@ app.post("/telegram-webhook", (req, res) => {
         console.log(`✅ Stored text reply for ${userId}: ${replyText.substring(0, 50)}`);
       }
     } else if (msg.text && isReply) {
-      // Text reply to a message
       addMessage(userId, "expert", "text", msg.text);
       console.log(`✅ Stored text reply (reply) for ${userId}: ${msg.text.substring(0, 50)}`);
     } else if (msg.photo) {
-      // Photo message
       const photo = msg.photo[msg.photo.length - 1];
       const fileId = photo.file_id;
       const caption = msg.caption || "";
       addMessage(userId, "expert", "photo", "Photo", fileId, caption);
       console.log(`✅ Stored photo for ${userId}`);
     } else if (msg.document) {
-      // Document message
       const fileId = msg.document.file_id;
       const fileName = msg.document.file_name || "Document";
       const caption = msg.caption || "";
       addMessage(userId, "expert", "document", fileName, fileId, caption);
       console.log(`✅ Stored document for ${userId}: ${fileName}`);
     } else if (msg.voice) {
-      // Voice message
       const fileId = msg.voice.file_id;
       const caption = msg.caption || "";
       addMessage(userId, "expert", "voice", "Voice message", fileId, caption);
       console.log(`✅ Stored voice message for ${userId}`);
-    } else if (msg.audio) {
-      // Audio message
-      const fileId = msg.audio.file_id;
-      const caption = msg.caption || "";
-      addMessage(userId, "expert", "voice", msg.audio.title || "Audio", fileId, caption);
-      console.log(`✅ Stored audio for ${userId}`);
     }
 
     return res.sendStatus(200);
   } catch (error) {
     console.error("❌ Webhook error:", error);
-    return res.sendStatus(200); // Always return 200 to Telegram
+    return res.sendStatus(200);
   }
 });
 
@@ -592,7 +465,6 @@ app.get("/telegram-file/:fileId", async (req, res) => {
   console.log(`📁 Requesting file: ${fileId}`);
   
   try {
-    // Get file path from Telegram
     const fileInfoUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`;
     const fileInfo = await axios.get(fileInfoUrl);
     
@@ -603,7 +475,6 @@ app.get("/telegram-file/:fileId", async (req, res) => {
     const filePath = fileInfo.data.result.file_path;
     const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
     
-    // Redirect to Telegram file
     res.redirect(fileUrl);
     
   } catch (error) {
@@ -624,25 +495,7 @@ app.get("/health", (_, res) => {
     sampleUsers: Array.from(messages.keys()).slice(0, 3),
     uploadDirExists: fs.existsSync('uploads')
   };
-  console.log("🏥 Health check:", stats);
   res.json(stats);
-});
-
-app.get("/debug", (_, res) => {
-  const debugInfo = {
-    messages: Array.from(messages.entries()).map(([userId, msgs]) => ({
-      userId,
-      count: msgs.length,
-      types: msgs.map(m => m.type),
-      lastMessage: msgs[msgs.length - 1]
-    })),
-    env: {
-      hasBotToken: !!BOT_TOKEN,
-      hasChatId: !!CHAT_ID,
-      port: PORT
-    }
-  };
-  res.json(debugInfo);
 });
 
 app.listen(PORT, () => {
@@ -652,10 +505,8 @@ app.listen(PORT, () => {
   console.log(`   POST /send-photo             - Send photo (multipart)`);
   console.log(`   POST /send-document          - Send document (multipart)`);
   console.log(`   POST /send-voice             - Send voice (multipart)`);
-  console.log(`   POST /send-media             - Send media (base64)`);
   console.log(`   POST /telegram-webhook       - Telegram webhook`);
   console.log(`   GET  /messages/:userId       - Get messages`);
   console.log(`   GET  /telegram-file/:fileId  - Get Telegram file`);
   console.log(`   GET  /health                 - Health check`);
-  console.log(`   GET  /debug                  - Debug info`);
 });
